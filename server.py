@@ -12,7 +12,7 @@ pothole_log = []
 last_pothole_time = None
 POTHOLE_LOG_FILE = "potholes.csv"
 POTHOLE_IMAGE_DIR = "pothole_images"
-DUPLICATE_TIME_SECONDS = 10
+DUPLICATE_TIME_SECONDS = 5
 
 HTML_PAGE = """
 <!DOCTYPE html>
