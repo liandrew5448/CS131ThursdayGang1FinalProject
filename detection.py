@@ -3,16 +3,18 @@ import os
 import platform
 import json
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import torch
 from ultralytics import YOLO
 
-
-CAMERA_INDEXES = (0, 1, 2, 3)
+CAMERA_INDEXES = (0, 1)
+PREFERRED_CAMERA_INDEX = os.environ.get("CAMERA_INDEX")
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 IMG_SIZE = 320
@@ -25,12 +27,19 @@ POTHOLE_SERVER_URL = os.environ.get(
     "https://127.0.0.1:5002/pothole",
 )
 POTHOLE_LOG_COOLDOWN_SECONDS = 5
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+PREVIEW_HOST = os.environ.get("PREVIEW_HOST", "0.0.0.0")
+PREVIEW_PORT = int(os.environ.get("PREVIEW_PORT", "8080"))
+PREVIEW_JPEG_QUALITY = 70
+
+latest_preview_frame = None
+preview_frame_condition = threading.Condition()
 
 
 def pick_model_path():
     if os.path.exists("best.engine"):
         return "best.engine"
-    return "best.pt"
+    return "best1500.pt"
 
 
 def pick_device():
@@ -47,6 +56,7 @@ def print_device_info(device):
     print("CUDA available:", torch.cuda.is_available())
     print("CUDA device count:", torch.cuda.device_count())
     print("MPS available:", torch.backends.mps.is_available())
+    
 
     if torch.cuda.is_available():
         print("CUDA device name:", torch.cuda.get_device_name(0))
@@ -60,6 +70,9 @@ def print_device_info(device):
 
 
 def configure_camera(cap):
+    if platform.system() == "Darwin":
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, 30)
@@ -68,27 +81,35 @@ def configure_camera(cap):
 
 def open_camera():
     is_mac = platform.system() == "Darwin"
+    camera_indexes = CAMERA_INDEXES
+    if PREFERRED_CAMERA_INDEX is not None:
+        camera_indexes = (int(PREFERRED_CAMERA_INDEX),)
 
-    for camera_index in CAMERA_INDEXES:
-        if is_mac:
-            cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
-        else:
-            cap = cv2.VideoCapture(camera_index)
+    for camera_index in camera_indexes:
+        backends = (cv2.CAP_AVFOUNDATION, cv2.CAP_ANY) if is_mac else (cv2.CAP_ANY,)
+        for backend in backends:
+            cap = cv2.VideoCapture(camera_index, backend)
+            configure_camera(cap)
 
-        configure_camera(cap)
+            if not cap.isOpened():
+                cap.release()
+                continue
 
-        if not cap.isOpened():
+            backend_name = "AVFoundation" if backend == cv2.CAP_AVFOUNDATION else "default"
+            print(
+                "Waiting for camera index",
+                camera_index,
+                f"({backend_name}) to return frames...",
+            )
+            max_attempts = 30 if is_mac else 5
+            for _ in range(max_attempts):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print("Using camera index:", camera_index, "backend:", backend_name)
+                    return cap
+                time.sleep(0.1)
+
             cap.release()
-            continue
-
-        for _ in range(5):
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print("Using camera index:", camera_index)
-                return cap
-            time.sleep(0.1)
-
-        cap.release()
 
     return None
 
@@ -121,6 +142,78 @@ def send_pothole_event(count, max_confidence, image):
         print("Could not log pothole:", error)
 
 
+def update_preview_frame(frame):
+    global latest_preview_frame
+
+    success, encoded_frame = cv2.imencode(
+        ".jpg",
+        frame,
+        [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY],
+    )
+    if not success:
+        return
+
+    with preview_frame_condition:
+        latest_preview_frame = encoded_frame.tobytes()
+        preview_frame_condition.notify_all()
+
+
+class PreviewRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"""<!DOCTYPE html>
+<html>
+<head><title>Jetson Pothole Detection Preview</title></head>
+<body style="margin:0;background:#111;color:#fff;font-family:Arial,sans-serif">
+<h2 style="padding:12px 16px;margin:0">Jetson Pothole Detection Preview</h2>
+<img src="/video_feed" alt="Live pothole detection preview"
+     style="display:block;max-width:100%;height:auto">
+</body>
+</html>"""
+            )
+            return
+
+        if self.path != "/video_feed":
+            self.send_error(404)
+            return
+
+        self.send_response(200)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+
+        try:
+            while True:
+                with preview_frame_condition:
+                    preview_frame_condition.wait(timeout=1)
+                    frame = latest_preview_frame
+
+                if frame is None:
+                    continue
+
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_preview_server():
+    server = ThreadingHTTPServer((PREVIEW_HOST, PREVIEW_PORT), PreviewRequestHandler)
+    preview_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    preview_thread.start()
+    print(f"Browser preview: http://JETSON_IP:{PREVIEW_PORT}/")
+
+
 def get_detection_summary(result):
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
@@ -137,6 +230,8 @@ def main():
     print_device_info(device)
     print("Using model:", model_path)
     print("Pothole server:", POTHOLE_SERVER_URL)
+    print("Headless mode:", HEADLESS)
+    start_preview_server()
 
     model = YOLO(model_path)
 
@@ -201,14 +296,17 @@ def main():
             (0, 255, 0),
             2,
         )
+        update_preview_frame(output_frame)
 
-        cv2.imshow("YOLO Detection", output_frame)
+        if not HEADLESS:
+            cv2.imshow("YOLO Detection", output_frame)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cap.release()
-    cv2.destroyAllWindows()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

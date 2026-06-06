@@ -1,6 +1,10 @@
 import base64
 import csv
+import json
 import os
+import ssl
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
@@ -13,6 +17,9 @@ last_pothole_time = None
 POTHOLE_LOG_FILE = "potholes.csv"
 POTHOLE_IMAGE_DIR = "pothole_images"
 DUPLICATE_TIME_SECONDS = 5
+CLOUD_SERVER_URL = os.environ.get("CLOUD_SERVER_URL")
+CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
+CLOUD_MIN_CONFIDENCE = float(os.environ.get("CLOUD_MIN_CONFIDENCE", "0.70"))
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -97,6 +104,43 @@ def gps():
 def latest():
     return jsonify({"gps": latest_gps})
 
+def get_cloud_skip_reason(log_entry):
+    if not CLOUD_SERVER_URL:
+        return "cloud_not_configured"
+    if log_entry["lat"] is None or log_entry["lng"] is None:
+        return "missing_gps"
+    if not log_entry["image_path"]:
+        return "missing_image"
+    if (log_entry["max_confidence"] or 0) < CLOUD_MIN_CONFIDENCE:
+        return "low_confidence"
+    return None
+
+def send_to_cloud(log_entry, image_base64):
+    cloud_event = dict(log_entry)
+    cloud_event["image"] = image_base64
+    cloud_event.pop("image_path", None)
+    data = json.dumps(cloud_event).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if CLOUD_API_KEY:
+        headers["X-API-Key"] = CLOUD_API_KEY
+
+    cloud_request = urllib.request.Request(
+        CLOUD_SERVER_URL,
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        context = ssl._create_unverified_context()
+        with urllib.request.urlopen(cloud_request, timeout=5, context=context) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+        print("CLOUD UPLOAD:", response_data)
+        return {"status": "uploaded", "response": response_data}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        print("CLOUD UPLOAD FAILED:", error)
+        return {"status": "failed", "error": str(error)}
+
 @app.route("/pothole", methods=["POST"])
 def pothole():
     global last_pothole_time
@@ -151,11 +195,21 @@ def pothole():
 
     print("POTHOLE DETECTED:", log_entry)
 
-    return jsonify({"status": "logged", "event": log_entry})
+    cloud_skip_reason = get_cloud_skip_reason(log_entry)
+    if cloud_skip_reason:
+        cloud_result = {"status": "skipped", "reason": cloud_skip_reason}
+        print("CLOUD UPLOAD SKIPPED:", cloud_skip_reason)
+    else:
+        cloud_result = send_to_cloud(log_entry, image_base64)
+
+    return jsonify({"status": "logged", "event": log_entry, "cloud": cloud_result})
 
 @app.route("/potholes")
 def potholes():
     return jsonify({"potholes": pothole_log})
 
 
-app.run(host="0.0.0.0", port=5002, ssl_context="adhoc")
+if __name__ == "__main__":
+    print("Cloud server:", CLOUD_SERVER_URL or "not configured")
+    print("Cloud minimum confidence:", CLOUD_MIN_CONFIDENCE)
+    app.run(host="0.0.0.0", port=5002, ssl_context="adhoc")
